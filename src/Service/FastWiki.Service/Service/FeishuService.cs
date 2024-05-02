@@ -1,5 +1,4 @@
-﻿using FastWiki.Service.Application.Storage.Queries;
-using FastWiki.Service.Contracts.Feishu.Dto;
+﻿using FastWiki.Service.Contracts.Feishu.Dto;
 using FastWiki.Service.Contracts.Model.Dto;
 using FastWiki.Service.Domain.Storage.Aggregates;
 using FastWiki.Service.Infrastructure;
@@ -17,7 +16,10 @@ using TokenApi.Service.Exceptions;
 
 namespace FastWiki.Service.Service;
 
-public class FeishuService
+public class FeishuService(
+    IChatApplicationRepository chatApplicationRepository,
+    IMapper mapper,
+    IFileStorageRepository fileStorageRepository)
 {
     private static HttpClient httpClient = new();
 
@@ -27,7 +29,7 @@ public class FeishuService
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
-    public static async Task Completions(string id, HttpContext context, [FromBody] FeishuChatInput input)
+    public async Task Completions(string id, HttpContext context, [FromBody] FeishuChatInput input)
     {
         var memoryCache = context.RequestServices.GetRequiredService<IMemoryCache>();
 
@@ -78,20 +80,14 @@ public class FeishuService
 
             memoryCache.Set(eventId, true, TimeSpan.FromHours(1));
 
-            var eventBus = context.RequestServices.GetRequiredService<IEventBus>();
-            var chatShareInfoQuery = new ChatShareInfoQuery(id);
+            var result = await chatApplicationRepository.GetChatShareAsync(id);
 
-            await eventBus.PublishAsync(chatShareInfoQuery);
-
-            var getApiKeyChatShareQuery = new GetAPIKeyChatShareQuery(string.Empty);
             // 如果chatShareId不存在则返回让下面扣款
-            getApiKeyChatShareQuery.Result = chatShareInfoQuery.Result;
+            var apiKey = mapper.Map<ChatShareDto>(result);
 
-            var chatApplicationQuery = new ChatApplicationInfoQuery(chatShareInfoQuery.Result.ChatApplicationId);
-
-            await eventBus.PublishAsync(chatApplicationQuery);
-
-            var chatApplication = chatApplicationQuery?.Result;
+            var chatApplication =
+                mapper.Map<ChatApplicationDto>(
+                    await chatApplicationRepository.FindAsync(apiKey.ChatApplicationId));
 
             if (chatApplication == null)
             {
@@ -125,7 +121,7 @@ public class FeishuService
 
                 var text = new StringBuilder();
 
-                await ChatMessageAsync(getApiKeyChatShareQuery, chatApplication, context, history, id,
+                await ChatMessageAsync(apiKey, chatApplication, context, history, id,
                     async x => { text.Append(x); });
 
                 await SendMessages(chatApplication, sessionId, text.ToString());
@@ -171,7 +167,7 @@ public class FeishuService
 
                 var text = new StringBuilder();
 
-                await ChatMessageAsync(getApiKeyChatShareQuery, chatApplication, context, history, id,
+                await ChatMessageAsync(apiKey, chatApplication, context, history, id,
                     async x => { text.Append(x); });
 
                 await SendMessages(chatApplication, chatId, text.ToString(), "chat_id");
@@ -191,7 +187,7 @@ public class FeishuService
     }
 
 
-    public static async Task ChatMessageAsync(GetAPIKeyChatShareQuery getAPIKeyChatShareQuery,
+    public async Task ChatMessageAsync(ChatShareDto getAPIKeyChatShareQuery,
         ChatApplicationDto chatApplication, HttpContext context,
         ChatHistory history, string chatShareId,
         Action<string> chatResponse)
@@ -263,11 +259,7 @@ public class FeishuService
             // 在这里需要获取源文件
             if (fileIds.Count > 0 && chatApplication.ShowSourceFile)
             {
-                var fileQuery = new StorageInfosQuery(fileIds);
-
-                await eventBus.PublishAsync(fileQuery);
-
-                sourceFile.AddRange(fileQuery.Result);
+                sourceFile.AddRange(await fileStorageRepository.GetListAsync(fileIds.ToArray()));
             }
 
             if (!prompt.IsNullOrEmpty())
@@ -282,20 +274,20 @@ public class FeishuService
         int requestToken = history.Where(x => !x.Content.IsNullOrEmpty()).Sum(x => TokenHelper.ComputeToken(x.Content));
 
 
-        if (getAPIKeyChatShareQuery?.Result != null)
+        if (getAPIKeyChatShareQuery != null)
         {
             // 如果token不足则返回，使用token和当前request总和大于可用token，则返回
-            if (getAPIKeyChatShareQuery.Result.AvailableToken != -1 &&
-                (getAPIKeyChatShareQuery.Result.UsedToken + requestToken) >=
-                getAPIKeyChatShareQuery.Result.AvailableToken)
+            if (getAPIKeyChatShareQuery.AvailableToken != -1 &&
+                (getAPIKeyChatShareQuery.UsedToken + requestToken) >=
+                getAPIKeyChatShareQuery.AvailableToken)
             {
                 await context.WriteEndAsync("Token不足");
                 return;
             }
 
             // 如果没有过期则继续
-            if (getAPIKeyChatShareQuery.Result.Expires != null &&
-                getAPIKeyChatShareQuery.Result.Expires < DateTimeOffset.Now)
+            if (getAPIKeyChatShareQuery.Expires != null &&
+                getAPIKeyChatShareQuery.Expires < DateTimeOffset.Now)
             {
                 await context.WriteEndAsync("Token已过期");
                 return;
@@ -345,56 +337,16 @@ public class FeishuService
             return;
         }
 
-        #region 记录对话内容
-
-        var createChatDialogHistoryCommand = new CreateChatDialogHistoryCommand(new CreateChatDialogHistoryInput()
-        {
-            ChatDialogId = string.Empty,
-            Id = requestId,
-            Content = question,
-            ExpendToken = requestToken,
-            Type = ChatDialogHistoryType.Text,
-            Current = true
-        });
-
-        await eventBus.PublishAsync(createChatDialogHistoryCommand);
-
-        var outputContent = output.ToString();
-        var completeToken = TokenHelper.ComputeToken(outputContent);
-
-        var chatDialogHistory = new CreateChatDialogHistoryCommand(new CreateChatDialogHistoryInput()
-        {
-            ChatDialogId = string.Empty,
-            Content = outputContent,
-            Id = responseId,
-            ExpendToken = completeToken,
-            Type = ChatDialogHistoryType.Text,
-            Current = false,
-            ReferenceFile = sourceFile.Select(x => new SourceFileDto()
-            {
-                Name = x.Name,
-                FileId = x.Id.ToString(),
-                FilePath = x.Path
-            }).ToList()
-        });
-
-        await eventBus.PublishAsync(chatDialogHistory);
-
-        #endregion
-
         //对于对话扣款
-        if (getAPIKeyChatShareQuery?.Result != null)
+        if (getAPIKeyChatShareQuery != null)
         {
-            var updateChatShareCommand = new DeductTokenCommand(getAPIKeyChatShareQuery.Result.Id,
-                requestToken);
-
-            await eventBus.PublishAsync(updateChatShareCommand);
+            await chatApplicationRepository.DeductTokenAsync(getAPIKeyChatShareQuery.Id, requestToken);
         }
     }
 
     private static readonly ConcurrentDictionary<string, DateTime> MemoryCache = new();
 
-    public static async ValueTask SendMessages(ChatApplicationDto chatApplication, string sessionId, string message,
+    public async ValueTask SendMessages(ChatApplicationDto chatApplication, string sessionId, string message,
         string receive_id_type = "open_id")
     {
         await SendMessages(chatApplication, new FeishuChatSendMessageInput(JsonSerializer.Serialize(new
@@ -403,7 +355,7 @@ public class FeishuService
         }, JsonSerializerOptions), "text", sessionId), receive_id_type);
     }
 
-    private static async ValueTask SendMessages(ChatApplicationDto chatApplication, FeishuChatSendMessageInput input,
+    private async ValueTask SendMessages(ChatApplicationDto chatApplication, FeishuChatSendMessageInput input,
         string receive_id_type = "open_id")
     {
         var requestMessage = new HttpRequestMessage(HttpMethod.Post,

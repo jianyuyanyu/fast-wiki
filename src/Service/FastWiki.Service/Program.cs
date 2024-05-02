@@ -54,6 +54,9 @@ if (ConnectionStringsOptions.DefaultConnection.IsNullOrEmpty())
 }
 
 builder.Services.AddInMemoryRateLimiting()
+    .AddScoped<OpenAIService>()
+    .AddScoped<FeishuService>()
+    .AddScoped<UnitOfWorkMiddleware>()
     .AddCors(options =>
     {
         options.AddPolicy("AllowAll",
@@ -128,6 +131,8 @@ builder.Services.AddInMemoryRateLimiting()
         {
             opt.UseNpgsql();
         }
+
+        opt.UseQueryTrackingBehavior(QueryTrackingBehavior.NoTrackingWithIdentityResolution);
     })
     .AddDomainEventBus(dispatcherOptions =>
     {
@@ -142,7 +147,7 @@ builder.Services.AddAutoInject();
 
 var app = builder.Services.AddServices(builder, option => option.MapHttpMethodsForUnmatched = ["Post"]);
 
-app.Use((async (context, next) =>
+app.Use(async (context, next) =>
 {
     var looger = context.RequestServices.GetRequiredService<ILogger<Program>>();
 
@@ -172,7 +177,9 @@ app.Use((async (context, next) =>
 
         await context.Response.WriteAsJsonAsync(ResultDto.CreateError(e.Message, "500"));
     }
-}));
+});
+
+app.UseMiddleware<UnitOfWorkMiddleware>();
 
 var fileExtensionContentTypeProvider = new FileExtensionContentTypeProvider
 {
@@ -194,13 +201,13 @@ app.UseCors("AllowAll");
 app.UseAuthentication();
 app.UseAuthorization();
 
-app.MapPost("/v1/chat/completions", OpenAIService.Completions)
+app.MapPost("/v1/chat/completions", (OpenAIService openAIService) => openAIService.Completions)
     .WithTags("OpenAI")
     .WithGroupName("OpenAI")
     .WithDescription("OpenAI Completions")
     .WithOpenApi();
 
-app.MapPost("/v1/feishu/completions/{id}", FeishuService.Completions)
+app.MapPost("/v1/feishu/completions/{id}", (FeishuService feishuService) => feishuService.Completions)
     .WithTags("Feishu")
     .WithGroupName("Feishu")
     .WithDescription("飞书对话接入处理")
